@@ -25,7 +25,7 @@ def format_task_dict(example, args):
 
 
 def main(args):
-    dataset_hf = load_dataset("osunlp/ScienceAgentBench", split="validation")
+    dataset_hf = load_dataset("osunlp/ScienceAgentBench", split="verified")
 
     agent = ScienceAgent(
         args.llm_engine_name,
