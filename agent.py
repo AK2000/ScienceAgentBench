@@ -5,9 +5,114 @@ from litellm.utils import trim_messages
 from pathlib import Path
 from shutil import copyfile, rmtree
 
+import datetime
+import json
 import os
+import psutil
 import re
 import subprocess
+import threading
+import time
+
+
+class _ResourceMonitor:
+    """Continuously polls CPU and RSS memory of the current process tree.
+
+    Captures subprocesses via psutil.children(recursive=True) so that
+    conda/pip/python grandchildren are included in the measurements.
+
+    Each sample is written immediately as a JSON line so that activity
+    between subprocess calls is recorded alongside activity during them.
+    The label can be updated at any time from the main thread to tag which
+    phase each sample belongs to (e.g. "ambient" vs "install/pipreqs").
+    """
+
+    POLL_INTERVAL = 0.5
+
+    def __init__(self, label: str, log_file: str, task: str = ""):
+        self.label = label          # mutable; GIL makes str reads/writes atomic
+        self.task = task            # mutable; updated once per solve_task call
+        self.log_file = log_file
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def set_label(self, label: str) -> None:
+        self.label = label
+
+    @staticmethod
+    def _sum_disk_io(procs: list) -> tuple[int, int]:
+        """Return (read_bytes, write_bytes) summed across procs. Skips -1 values (unavailable on some platforms)."""
+        read = write = 0
+        for p in procs:
+            try:
+                io = p.io_counters()
+                if io.read_bytes != -1:
+                    read += io.read_bytes
+                if io.write_bytes != -1:
+                    write += io.write_bytes
+            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError, NotImplementedError, OSError):
+                pass
+        return read, write
+
+    def _collect(self) -> None:
+        pid = os.getpid()
+        try:
+            root = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            return
+
+        # Prime cpu_percent so the first real sample is non-zero
+        for p in [root] + root.children(recursive=True):
+            try:
+                p.cpu_percent(interval=None)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        # Baseline disk I/O counters for delta calculations
+        prev_disk = self._sum_disk_io([root] + root.children(recursive=True))
+
+        while not self._stop.is_set():
+            time.sleep(self.POLL_INTERVAL)
+            try:
+                procs = [root] + root.children(recursive=True)
+                cpu = sum(
+                    p.cpu_percent(interval=None)
+                    for p in procs
+                    if p.is_running()
+                )
+                mem = sum(
+                    p.memory_info().rss
+                    for p in procs
+                    if p.is_running()
+                )
+                curr_disk = self._sum_disk_io(procs)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+            entry = {
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "task": self.task,
+                "label": self.label,
+                "cpu_pct": round(cpu, 2),
+                "mem_mb": round(mem / 1024 ** 2, 2),
+                "disk_read_mb": round((curr_disk[0] - prev_disk[0]) / 1024 ** 2, 4),
+                "disk_write_mb": round((curr_disk[1] - prev_disk[1]) / 1024 ** 2, 4),
+            }
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+
+            prev_disk = curr_disk
+
+    def start(self) -> "_ResourceMonitor":
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._collect, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
 
 SYSTEM_PROMPT = """You are an expert Python programming assistant that helps scientist users to write high-quality code to solve their tasks.
 Given a user request, you are expected to write a complete program that accomplishes the requested task and save any outputs in the correct format.
@@ -34,16 +139,34 @@ Here are some helpful previews for the dataset file(s):
 
 
 class ScienceAgent():
-    def __init__(self, llm_engine_name, context_cutoff=28000, use_self_debug=False, use_knowledge=False):
+    def __init__(self, llm_engine_name, context_cutoff=28000, use_self_debug=False, use_knowledge=False, resource_log="resource_usage.jsonl"):
         self.llm_engine = LLMEngine(llm_engine_name)
-        self.llm_cost = model_cost[llm_engine_name]
+        try:
+            self.llm_cost = model_cost[llm_engine_name]
+        except:
+            from collections import defaultdict
+            self.llm_cost = defaultdict(float)
 
         self.context_cutoff = context_cutoff
         self.use_self_debug = use_self_debug
         self.use_knowledge = use_knowledge
+        self.resource_log = resource_log
 
         self.sys_msg = ""
         self.history = []
+        self._monitor: _ResourceMonitor | None = None
+        self._task_id: str = ""
+
+    def _monitored_run(self, cmd: list, label: str, **kwargs) -> subprocess.CompletedProcess:
+        """Run a subprocess while temporarily relabeling the active resource monitor."""
+        if self._monitor is not None:
+            prev_label = self._monitor.label
+            self._monitor.set_label(label)
+        try:
+            return subprocess.run(cmd, **kwargs)
+        finally:
+            if self._monitor is not None:
+                self._monitor.set_label(prev_label)
 
     def get_sys_msg(self, task):
         sys_msg = (
@@ -104,33 +227,37 @@ class ScienceAgent():
 
         copyfile(out_fname, Path("program_to_eval/", out_fname.split("/")[-1]))
 
-        exec_res = subprocess.run(
-            ["pipreqs", "program_to_eval/", "--savepath=requirements.in", "--mode", "no-pin"], 
-            capture_output=True
+        exec_res = self._monitored_run(
+            ["pipreqs", "program_to_eval/", "--savepath=requirements.in", "--mode", "no-pin"],
+            label="install/pipreqs",
+            capture_output=True,
         )
         if exec_res.returncode != 0:
             err_msg = "There is a problem extracting packages used in the program. Please use packages that are easier to identify and install via pip."
-            
+
             return True, err_msg
-        
-        exec_res = subprocess.run(
+
+        exec_res = self._monitored_run(
             ["conda", "run", "-n", "sci-agent-eval", "pip-compile", "--upgrade-package", "numpy<2.0", "--resolver", "legacy", "--output-file", "eval_requirements.txt"],
-            capture_output=True
+            label="install/pip-compile-legacy",
+            capture_output=True,
         )
         if exec_res.returncode != 0:
             print('Legacy resolver failed. Trying backtracking resolver...')
-            exec_res = subprocess.run(
-                ["conda", "run", "-n", "sci-agent-eval", "pip-compile", "--upgrade-package", "numpy<2.0", "--output-file", "eval_requirements.txt"], 
-                capture_output=True
+            exec_res = self._monitored_run(
+                ["conda", "run", "-n", "sci-agent-eval", "pip-compile", "--upgrade-package", "numpy<2.0", "--output-file", "eval_requirements.txt"],
+                label="install/pip-compile-backtrack",
+                capture_output=True,
             )
             if exec_res.returncode != 0:
                 err_msg = "There is a problem resolving the requirements of packages used in the program. Please use packages that do not have conflicts."
-            
+
                 return True, err_msg
 
-        exec_res = subprocess.run(
-            ["conda", "run", "-n", "sci-agent-eval", "pip-sync", "eval_requirements.txt"], 
-            capture_output=True
+        exec_res = self._monitored_run(
+            ["conda", "run", "-n", "sci-agent-eval", "pip-sync", "eval_requirements.txt"],
+            label="install/pip-sync",
+            capture_output=True,
         )
         if exec_res.returncode != 0:
             err_msg = exec_res.stderr.decode("utf-8")
@@ -155,7 +282,12 @@ class ScienceAgent():
 
         if not special_err:
             try:
-                exec_res = subprocess.run(["conda", "run", "-n", "sci-agent-eval", "python", "-m", out_module_name], capture_output=True, timeout=900)
+                exec_res = self._monitored_run(
+                    ["conda", "run", "-n", "sci-agent-eval", "python", "-m", out_module_name],
+                    label="step/run-program",
+                    capture_output=True,
+                    timeout=900,
+                )
             except subprocess.TimeoutExpired:
                 special_err = True
                 err_msg = "The program fails to finish execution within 900 seconds. Please try to reduce the execution time of your implementation."
@@ -206,35 +338,41 @@ class ScienceAgent():
         # Clean history
         self.history = []
 
-        self.sys_msg = self.get_sys_msg(task)
+        self._task_id = Path(out_fname).stem
+        self._monitor = _ResourceMonitor("ambient", self.resource_log, task=self._task_id).start()
+        try:
+            self.sys_msg = self.get_sys_msg(task)
 
-        user_input = [
-            {'role': 'user', 'content': self.sys_msg}
-        ]
+            user_input = [
+                {'role': 'user', 'content': self.sys_msg}
+            ]
 
-        assistant_output, prompt_tokens, completion_tokens = self.llm_engine.respond(user_input, temperature=0.2, top_p=0.95)
+            assistant_output, prompt_tokens, completion_tokens = self.llm_engine.respond(user_input, temperature=0.2, top_p=0.95)
 
-        cost = (
-            self.llm_cost["input_cost_per_token"] * prompt_tokens +
-            self.llm_cost["output_cost_per_token"] * completion_tokens
-        )
+            cost = (
+                self.llm_cost["input_cost_per_token"] * prompt_tokens +
+                self.llm_cost["output_cost_per_token"] * completion_tokens
+            )
 
-        self.write_program(assistant_output, out_fname)
+            self.write_program(assistant_output, out_fname)
 
-        self.history.append(
-            {'role': 'assistant', 'content': assistant_output}
-        )
+            self.history.append(
+                {'role': 'assistant', 'content': assistant_output}
+            )
 
-        if self.use_self_debug:
-            for t in range(10):
-                halt, new_cost = self.step(out_fname, task["output_fname"])
-                cost += new_cost
-                if halt:
-                    break
+            if self.use_self_debug:
+                for t in range(10):
+                    halt, new_cost = self.step(out_fname, task["output_fname"])
+                    cost += new_cost
+                    if halt:
+                        break
 
-        self.history = [
-            {'role': 'user', 'content': self.sys_msg}
-        ] + self.history
+            self.history = [
+                {'role': 'user', 'content': self.sys_msg}
+            ] + self.history
+        finally:
+            self._monitor.stop()
+            self._monitor = None
 
         return {"history": self.history, "cost": cost}
 
